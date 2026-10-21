@@ -22,6 +22,7 @@
     <test name="tenant-keystore-mgt-test-suite">
         <classes>
             <class name="org.wso2.carbon.keystore.mgt.KeyStoreGeneratorTest"/>
+            <class name="org.wso2.carbon.keystore.mgt.KeyStoreGeneratorPKCS11Test"/>
         </classes>
     </test>
 </suite>

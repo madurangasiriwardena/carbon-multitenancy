@@ -1,5 +1,5 @@
 /*
- * Copyright (c) (2005-2023), WSO2 LLC. (http://www.wso2.com).
+ * Copyright (c) (2005-2026), WSO2 LLC. (http://www.wso2.com).
  *
  * WSO2 LLC. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"); you may not use this file except
@@ -37,11 +37,15 @@ import org.wso2.carbon.utils.security.KeystoreUtils;
 
 import java.io.ByteArrayOutputStream;
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
 import java.security.PrivateKey;
+import java.security.Provider;
 import java.security.SecureRandom;
+import java.security.Security;
+import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.util.Date;
 
@@ -66,6 +70,15 @@ public class KeyStoreGenerator {
     private static final String[] signatureAlgorithms = new String[]{
             RSA_MD5, RSA_SHA1, RSA_SHA256, RSA_SHA384, RSA_SHA512
     };
+
+    // Tenant key stores held in a PKCS#11 token (HSM): [keystore.tenant] type = "PKCS11".
+    private static final String PKCS11_STORE_TYPE = "PKCS11";
+    private static final String TENANT_KEYSTORE_PROVIDER = "Security.TenantKeyStore.Provider";
+    private static final String TENANT_KEYSTORE_PASSWORD = "Security.TenantKeyStore.Password";
+    // Token entry label of a tenant key pair. Based on the tenant ID, so it does not change on a tenant rename.
+    private static final String TOKEN_LABEL_PREFIX = "wso2-tenant-";
+    // Content of a PKCS11 tenant key store record: a descriptor that names the token entry, no key material.
+    private static final String DESCRIPTOR_LABEL_PROPERTY = "label";
 
 
 
@@ -94,6 +107,10 @@ public class KeyStoreGenerator {
             keySize = KeystoreUtils.getTenantKeySize();
         } catch (CarbonException e) {
             throw new KeyStoreMgtException(e.getMessage(), e);
+        }
+        if (PKCS11_STORE_TYPE.equals(KeystoreUtils.StoreFileType.defaultFileType())) {
+            generatePKCS11KeyStore(keyAlgorithm, keySize);
+            return;
         }
         try {
             password = generatePassword();
@@ -168,33 +185,10 @@ public class KeyStoreGenerator {
             keyPairGenerator.initialize(keySize);
             KeyPair keyPair = keyPairGenerator.generateKeyPair();
 
-            // Common Name and alias for the generated certificate
-            String commonName = "CN=" + tenantDomain + ", OU=None, O=None, L=None";
-
-            //generate certificates
-            X500Name distinguishedName = new X500Name(commonName);
-
-            Date notBefore = new Date(System.currentTimeMillis() - 1000L * 60 * 60 * 24 * 30);
-            Date notAfter = new Date(System.currentTimeMillis() + (1000L * 60 * 60 * 24 * 365 * 10));
-
-            SubjectPublicKeyInfo subPubKeyInfo = SubjectPublicKeyInfo.getInstance(keyPair.getPublic().getEncoded());
-            BigInteger serialNumber = new BigInteger(32, new SecureRandom());
-
-            X509v3CertificateBuilder certificateBuilder = new X509v3CertificateBuilder(
-                    distinguishedName,
-                    serialNumber,
-                    notBefore,
-                    notAfter,
-                    distinguishedName,
-                    subPubKeyInfo
-            );
-
             String algorithmName = getSignatureAlgorithm();
             JcaContentSignerBuilder signerBuilder =
                     new JcaContentSignerBuilder(algorithmName).setProvider(getJCEProvider());
-            PrivateKey privateKey = keyPair.getPrivate();
-            X509Certificate x509Cert = new JcaX509CertificateConverter().setProvider(getJCEProvider())
-                    .getCertificate(certificateBuilder.build(signerBuilder.build(privateKey)));
+            X509Certificate x509Cert = createSelfSignedCertificate(keyPair, signerBuilder);
 
             //add private key to KS
             keyStore.setKeyEntry(tenantDomain, keyPair.getPrivate(), password.toCharArray(),
@@ -207,6 +201,115 @@ public class KeyStoreGenerator {
             throw new KeyStoreMgtException(msg, ex);
         }
 
+    }
+
+    /**
+     * Create the self-signed certificate of the tenant key pair.
+     *
+     * @param keyPair       Tenant key pair.
+     * @param signerBuilder Signer for the certificate, bound to the provider that can use the private key.
+     * @return Self-signed certificate.
+     * @throws Exception Error when building or signing the certificate.
+     */
+    private X509Certificate createSelfSignedCertificate(KeyPair keyPair, JcaContentSignerBuilder signerBuilder)
+            throws Exception {
+
+        // Common Name and alias for the generated certificate
+        String commonName = "CN=" + tenantDomain + ", OU=None, O=None, L=None";
+
+        //generate certificates
+        X500Name distinguishedName = new X500Name(commonName);
+
+        Date notBefore = new Date(System.currentTimeMillis() - 1000L * 60 * 60 * 24 * 30);
+        Date notAfter = new Date(System.currentTimeMillis() + (1000L * 60 * 60 * 24 * 365 * 10));
+
+        SubjectPublicKeyInfo subPubKeyInfo = SubjectPublicKeyInfo.getInstance(keyPair.getPublic().getEncoded());
+        BigInteger serialNumber = new BigInteger(32, new SecureRandom());
+
+        X509v3CertificateBuilder certificateBuilder = new X509v3CertificateBuilder(
+                distinguishedName,
+                serialNumber,
+                notBefore,
+                notAfter,
+                distinguishedName,
+                subPubKeyInfo
+        );
+        PrivateKey privateKey = keyPair.getPrivate();
+        return new JcaX509CertificateConverter().setProvider(getJCEProvider())
+                .getCertificate(certificateBuilder.build(signerBuilder.build(privateKey)));
+    }
+
+    /**
+     * Generate the tenant key pair in the PKCS#11 token configured by {@code [keystore.tenant] provider} and
+     * register a PKCS11 tenant key store that refers to it. The key pair is generated in the token and the
+     * self-signed certificate is signed in the token, so the private key never exists outside the token.
+     *
+     * @param keyAlgorithm Key algorithm of the key pair.
+     * @param keySize      Key size of the key pair in bits.
+     * @throws KeyStoreMgtException Error when the token is not configured, or generating or storing the key fails.
+     */
+    private void generatePKCS11KeyStore(String keyAlgorithm, int keySize) throws KeyStoreMgtException {
+
+        ServerConfiguration config = ServerConfiguration.getInstance();
+        String providerName = StringUtils.trim(config.getFirstProperty(TENANT_KEYSTORE_PROVIDER));
+        String pin = config.getFirstProperty(TENANT_KEYSTORE_PASSWORD);
+        if (StringUtils.isBlank(providerName) || StringUtils.isEmpty(pin)) {
+            throw new KeyStoreMgtException("[keystore.tenant] provider and password are required when the tenant " +
+                    "key store type is " + PKCS11_STORE_TYPE + ".");
+        }
+        Provider provider = Security.getProvider(providerName);
+        if (provider == null) {
+            throw new KeyStoreMgtException("The JCA provider '" + providerName + "' of the tenant key store token " +
+                    "is not registered.");
+        }
+
+        String label = TOKEN_LABEL_PREFIX + tenantId;
+        KeyStore token;
+        try {
+            token = KeyStore.getInstance(PKCS11_STORE_TYPE, provider);
+            token.load(null, pin.toCharArray());
+            if (token.containsAlias(label)) {
+                throw new KeyStoreMgtException("The tenant key store token already has an entry with label: " +
+                        label);
+            }
+            KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance(keyAlgorithm, provider);
+            keyPairGenerator.initialize(keySize);
+            KeyPair keyPair = keyPairGenerator.generateKeyPair();
+            JcaContentSignerBuilder signerBuilder =
+                    new JcaContentSignerBuilder(getSignatureAlgorithm()).setProvider(provider);
+            X509Certificate certificate = createSelfSignedCertificate(keyPair, signerBuilder);
+            token.setKeyEntry(label, keyPair.getPrivate(), null, new Certificate[]{certificate});
+        } catch (KeyStoreMgtException e) {
+            throw e;
+        } catch (Exception e) {
+            String msg = "Error while generating the key pair of tenant: " + tenantDomain + " in the token of " +
+                    "provider: " + providerName;
+            log.error(msg, e);
+            throw new KeyStoreMgtException(msg, e);
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("Generated the key pair of tenant: " + tenantDomain + " in the token of provider: " +
+                    providerName + " with label: " + label);
+        }
+
+        try {
+            byte[] descriptor =
+                    (DESCRIPTOR_LABEL_PROPERTY + "=" + label + "\n").getBytes(StandardCharsets.ISO_8859_1);
+            KeyStoreAdmin keystoreAdmin = new KeyStoreAdmin(tenantId);
+            keystoreAdmin.addKeyStore(descriptor, generateKSNameFromDomainName(), pin, providerName,
+                    PKCS11_STORE_TYPE, pin);
+        } catch (Exception e) {
+            // Do not leave an unreferenced key pair in the token.
+            try {
+                token.deleteEntry(label);
+            } catch (Exception deleteError) {
+                log.error("Error while removing the token entry: " + label + " after a failed key store " +
+                        "registration.", deleteError);
+            }
+            String msg = "Error when registering the PKCS11 key store of tenant: " + tenantDomain;
+            log.error(msg, e);
+            throw new KeyStoreMgtException(msg, e);
+        }
     }
 
     /**
