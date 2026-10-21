@@ -73,6 +73,7 @@ public class KeyStoreGenerator {
 
     // Tenant key stores held in a PKCS#11 token (HSM): [keystore.tenant] type = "PKCS11".
     private static final String PKCS11_STORE_TYPE = "PKCS11";
+    private static final String PKCS11_KEYSTORE_EXTENSION = ".p11";
     private static final String TENANT_KEYSTORE_PROVIDER = "Security.TenantKeyStore.Provider";
     private static final String TENANT_KEYSTORE_PASSWORD = "Security.TenantKeyStore.Password";
     // Token entry label of a tenant key pair. Based on the tenant ID, so it does not change on a tenant rename.
@@ -201,6 +202,40 @@ public class KeyStoreGenerator {
             throw new KeyStoreMgtException(msg, ex);
         }
 
+    }
+
+    /**
+     * Delete the tenant's PKCS11 key store, if the tenant has one. Deleting it also removes the tenant key pair from
+     * the token. Tenants with file based key stores are not changed.
+     *
+     * @throws KeyStoreMgtException Error when deleting the key store.
+     */
+    public void deletePKCS11KeyStore() throws KeyStoreMgtException {
+
+        String keyStoreName = tenantDomain.trim().replace(".", "-") + PKCS11_KEYSTORE_EXTENSION;
+        KeyStoreAdmin keyStoreAdmin = new KeyStoreAdmin(tenantId);
+        KeyStore keyStore;
+        try {
+            keyStore = keyStoreAdmin.getKeyStore(keyStoreName);
+        } catch (Exception e) {
+            if (log.isDebugEnabled()) {
+                log.debug("Tenant: " + tenantDomain + " has no PKCS11 key store.", e);
+            }
+            return;
+        }
+        if (keyStore == null || !PKCS11_STORE_TYPE.equals(keyStore.getType())) {
+            return;
+        }
+        try {
+            keyStoreAdmin.deleteStore(keyStoreName);
+        } catch (Exception e) {
+            String msg = "Error while deleting the PKCS11 key store of tenant: " + tenantDomain;
+            log.error(msg, e);
+            throw new KeyStoreMgtException(msg, e);
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("Deleted the PKCS11 key store of tenant: " + tenantDomain);
+        }
     }
 
     /**

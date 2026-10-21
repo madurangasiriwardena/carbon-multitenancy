@@ -47,6 +47,8 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
 import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
@@ -74,6 +76,8 @@ public class KeyStoreGeneratorPKCS11Test {
     private TestTokenProvider tokenProvider;
     private Object[] persistedArguments;
     private boolean failRegistration;
+    // What KeyStoreAdmin.getKeyStore returns: a KeyStore, or an Exception to throw.
+    private Object existingKeyStore;
 
     @BeforeMethod
     public void setUp() throws Exception {
@@ -103,7 +107,14 @@ public class KeyStoreGeneratorPKCS11Test {
 
         persistedArguments = null;
         failRegistration = false;
+        existingKeyStore = new SecurityException("Key Store does not exist.");
         keyStoreAdminConstruction = mockConstruction(KeyStoreAdmin.class, (keyStoreAdmin, context) -> {
+            doAnswer(invocation -> {
+                if (existingKeyStore instanceof Exception) {
+                    throw (Exception) existingKeyStore;
+                }
+                return existingKeyStore;
+            }).when(keyStoreAdmin).getKeyStore(anyString());
             if (failRegistration) {
                 doThrow(new SecurityConfigException("registration failed")).when(keyStoreAdmin).addKeyStore(
                         any(byte[].class), anyString(), anyString(), anyString(), anyString(), anyString());
@@ -200,5 +211,47 @@ public class KeyStoreGeneratorPKCS11Test {
         failRegistration = true;
         expectThrows(KeyStoreMgtException.class, () -> new KeyStoreGenerator(TENANT_ID).generateKeyStore());
         assertFalse(tokenProvider.getToken().containsAlias(LABEL), "An unreferenced key pair was left in the token.");
+    }
+
+    @Test
+    public void testDeletePKCS11KeyStore() throws Exception {
+
+        KeyStore pkcs11KeyStore = KeyStore.getInstance("PKCS11", tokenProvider);
+        pkcs11KeyStore.load(null, PIN.toCharArray());
+        existingKeyStore = pkcs11KeyStore;
+
+        new KeyStoreGenerator(TENANT_ID).deletePKCS11KeyStore();
+        verify(lastKeyStoreAdmin()).deleteStore("hsm-com.p11");
+    }
+
+    @Test
+    public void testDeleteLeavesFileBasedAndMissingKeyStores() throws Exception {
+
+        KeyStore fileBased = KeyStore.getInstance("PKCS12");
+        fileBased.load(null, null);
+        existingKeyStore = fileBased;
+        new KeyStoreGenerator(TENANT_ID).deletePKCS11KeyStore();
+        verify(lastKeyStoreAdmin(), never()).deleteStore(anyString());
+
+        existingKeyStore = new SecurityException("Key Store does not exist.");
+        new KeyStoreGenerator(TENANT_ID).deletePKCS11KeyStore();
+        verify(lastKeyStoreAdmin(), never()).deleteStore(anyString());
+    }
+
+    @Test
+    public void testTenantDeleteListenerDeletesPKCS11KeyStore() throws Exception {
+
+        KeyStore pkcs11KeyStore = KeyStore.getInstance("PKCS11", tokenProvider);
+        pkcs11KeyStore.load(null, PIN.toCharArray());
+        existingKeyStore = pkcs11KeyStore;
+
+        new KeystoreTenantMgtListener().onPreDelete(TENANT_ID);
+        verify(lastKeyStoreAdmin()).deleteStore("hsm-com.p11");
+    }
+
+    private KeyStoreAdmin lastKeyStoreAdmin() {
+
+        java.util.List<KeyStoreAdmin> constructed = keyStoreAdminConstruction.constructed();
+        return constructed.get(constructed.size() - 1);
     }
 }

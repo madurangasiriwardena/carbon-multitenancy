@@ -85,6 +85,14 @@ public class KeystoreTenantMgtListener implements TenantMgtListener {
 
 	@Override
 	public void onPreDelete(int tenantId) throws StratosException {
-		//Implement this method to delete product specific data
+
+		// A PKCS11 tenant key store refers to a key pair in a token shared by tenants; remove it with the tenant.
+		try {
+			new KeyStoreGenerator(tenantId).deletePKCS11KeyStore();
+		} catch (KeyStoreMgtException e) {
+			String msg = "Error while deleting the PKCS11 key store of tenant: " + tenantId;
+			log.error(msg, e);
+			throw new StratosException(msg, e);
+		}
 	}
 }
