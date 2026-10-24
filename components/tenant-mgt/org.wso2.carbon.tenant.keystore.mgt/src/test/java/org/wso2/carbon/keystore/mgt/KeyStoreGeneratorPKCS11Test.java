@@ -26,21 +26,20 @@ import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 import org.wso2.carbon.base.ServerConfiguration;
 import org.wso2.carbon.core.util.CryptoUtil;
+import org.wso2.carbon.core.util.KeyStoreManager;
 import org.wso2.carbon.keystore.mgt.util.RealmServiceHolder;
-import org.wso2.carbon.security.SecurityConfigException;
 import org.wso2.carbon.security.keystore.KeyStoreAdmin;
 import org.wso2.carbon.user.core.service.RealmService;
 import org.wso2.carbon.user.core.tenant.TenantManager;
 import org.wso2.carbon.utils.CarbonUtils;
 
-import java.nio.charset.StandardCharsets;
 import java.security.Key;
 import java.security.KeyStore;
 import java.security.Security;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPublicKey;
 
-import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
@@ -53,7 +52,6 @@ import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotNull;
-import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.expectThrows;
 
@@ -72,10 +70,10 @@ public class KeyStoreGeneratorPKCS11Test {
     private MockedStatic<CarbonUtils> carbonUtils;
     private MockedStatic<CryptoUtil> cryptoUtil;
     private MockedConstruction<KeyStoreAdmin> keyStoreAdminConstruction;
+    private MockedStatic<KeyStoreManager> keyStoreManagerStatic;
+    private KeyStoreManager keyStoreManager;
     private ServerConfiguration serverConfiguration;
     private TestTokenProvider tokenProvider;
-    private Object[] persistedArguments;
-    private boolean failRegistration;
     // What KeyStoreAdmin.getKeyStore returns: a KeyStore, or an Exception to throw.
     private Object existingKeyStore;
 
@@ -105,8 +103,10 @@ public class KeyStoreGeneratorPKCS11Test {
         when(realmService.getTenantManager()).thenReturn(tenantManager);
         RealmServiceHolder.setRealmService(realmService);
 
-        persistedArguments = null;
-        failRegistration = false;
+        keyStoreManager = mock(KeyStoreManager.class);
+        keyStoreManagerStatic = mockStatic(KeyStoreManager.class);
+        keyStoreManagerStatic.when(() -> KeyStoreManager.getInstance(anyInt())).thenReturn(keyStoreManager);
+
         existingKeyStore = new SecurityException("Key Store does not exist.");
         keyStoreAdminConstruction = mockConstruction(KeyStoreAdmin.class, (keyStoreAdmin, context) -> {
             doAnswer(invocation -> {
@@ -115,16 +115,6 @@ public class KeyStoreGeneratorPKCS11Test {
                 }
                 return existingKeyStore;
             }).when(keyStoreAdmin).getKeyStore(anyString());
-            if (failRegistration) {
-                doThrow(new SecurityConfigException("registration failed")).when(keyStoreAdmin).addKeyStore(
-                        any(byte[].class), anyString(), anyString(), anyString(), anyString(), anyString());
-            } else {
-                doAnswer(invocation -> {
-                    persistedArguments = invocation.getArguments();
-                    return null;
-                }).when(keyStoreAdmin).addKeyStore(any(byte[].class), anyString(), anyString(), anyString(),
-                        anyString(), anyString());
-            }
         });
     }
 
@@ -132,6 +122,7 @@ public class KeyStoreGeneratorPKCS11Test {
     public void tearDown() {
 
         keyStoreAdminConstruction.close();
+        keyStoreManagerStatic.close();
         cryptoUtil.close();
         carbonUtils.close();
         serverConfigurationStatic.close();
@@ -158,14 +149,9 @@ public class KeyStoreGeneratorPKCS11Test {
         certificate.verify(certificate.getPublicKey());
         assertTrue(tokenProvider.getSignatureCount() > 0, "The certificate was not signed by the token.");
 
-        // The registered key store record refers to the token entry and contains no key material.
-        assertNotNull(persistedArguments, "The tenant key store was not registered.");
-        assertEquals(new String((byte[]) persistedArguments[0], StandardCharsets.ISO_8859_1).trim(),
-                "label=" + LABEL);
-        assertEquals(persistedArguments[1], "hsm-com.p11");
-        assertEquals(persistedArguments[2], PIN);
-        assertEquals(persistedArguments[3], PROVIDER_NAME);
-        assertEquals(persistedArguments[4], "PKCS11");
+        // The kernel registers the key store record for the tenant's label. No PIN or provider is passed to it.
+        verify(keyStoreManager).addTenantPKCS11KeyStore();
+        keyStoreManagerStatic.verify(() -> KeyStoreManager.getInstance(TENANT_ID));
     }
 
     @Test
@@ -179,7 +165,7 @@ public class KeyStoreGeneratorPKCS11Test {
         when(serverConfiguration.getFirstProperty("Security.TenantKeyStore.Provider")).thenReturn(PROVIDER_NAME);
         when(serverConfiguration.getFirstProperty("Security.TenantKeyStore.Password")).thenReturn(null);
         expectThrows(KeyStoreMgtException.class, () -> new KeyStoreGenerator(TENANT_ID).generateKeyStore());
-        assertNull(persistedArguments);
+        verify(keyStoreManager, never()).addTenantPKCS11KeyStore();
         assertFalse(tokenProvider.getToken().containsAlias(LABEL));
     }
 
@@ -190,7 +176,7 @@ public class KeyStoreGeneratorPKCS11Test {
         KeyStoreMgtException e = expectThrows(KeyStoreMgtException.class,
                 () -> new KeyStoreGenerator(TENANT_ID).generateKeyStore());
         assertTrue(e.getMessage().contains("is not registered"), e.getMessage());
-        assertNull(persistedArguments);
+        verify(keyStoreManager, never()).addTenantPKCS11KeyStore();
     }
 
     @Test
@@ -198,17 +184,17 @@ public class KeyStoreGeneratorPKCS11Test {
 
         new KeyStoreGenerator(TENANT_ID).generateKeyStore();
         X509Certificate existing = (X509Certificate) tokenProvider.getToken().getCertificate(LABEL);
-        persistedArguments = null;
 
         expectThrows(KeyStoreMgtException.class, () -> new KeyStoreGenerator(TENANT_ID).generateKeyStore());
         assertEquals(tokenProvider.getToken().getCertificate(LABEL), existing);
-        assertNull(persistedArguments);
+        // Registered only once, for the first generation.
+        verify(keyStoreManager).addTenantPKCS11KeyStore();
     }
 
     @Test
     public void testFailedRegistrationRemovesTheTokenEntry() throws Exception {
 
-        failRegistration = true;
+        doThrow(new SecurityException("registration failed")).when(keyStoreManager).addTenantPKCS11KeyStore();
         expectThrows(KeyStoreMgtException.class, () -> new KeyStoreGenerator(TENANT_ID).generateKeyStore());
         assertFalse(tokenProvider.getToken().containsAlias(LABEL), "An unreferenced key pair was left in the token.");
     }

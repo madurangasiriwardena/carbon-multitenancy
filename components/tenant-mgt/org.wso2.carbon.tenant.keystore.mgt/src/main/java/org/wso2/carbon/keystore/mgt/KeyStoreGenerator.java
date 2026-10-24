@@ -28,7 +28,10 @@ import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.wso2.carbon.CarbonException;
 import org.wso2.carbon.base.ServerConfiguration;
+import org.wso2.carbon.core.RegistryResources;
 import org.wso2.carbon.core.util.CryptoUtil;
+import org.wso2.carbon.core.util.KeyStoreManager;
+import org.wso2.carbon.core.util.TenantPKCS11KeyStore;
 import org.wso2.carbon.keystore.mgt.util.RealmServiceHolder;
 import org.wso2.carbon.security.keystore.KeyStoreAdmin;
 import org.wso2.carbon.user.core.service.RealmService;
@@ -37,7 +40,6 @@ import org.wso2.carbon.utils.security.KeystoreUtils;
 
 import java.io.ByteArrayOutputStream;
 import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
@@ -74,12 +76,6 @@ public class KeyStoreGenerator {
     // Tenant key stores held in a PKCS#11 token (HSM): [keystore.tenant] type = "PKCS11".
     private static final String PKCS11_STORE_TYPE = "PKCS11";
     private static final String PKCS11_KEYSTORE_EXTENSION = ".p11";
-    private static final String TENANT_KEYSTORE_PROVIDER = "Security.TenantKeyStore.Provider";
-    private static final String TENANT_KEYSTORE_PASSWORD = "Security.TenantKeyStore.Password";
-    // Token entry label of a tenant key pair. Based on the tenant ID, so it does not change on a tenant rename.
-    private static final String TOKEN_LABEL_PREFIX = "wso2-tenant-";
-    // Content of a PKCS11 tenant key store record: a descriptor that names the token entry, no key material.
-    private static final String DESCRIPTOR_LABEL_PROPERTY = "label";
 
 
 
@@ -286,8 +282,9 @@ public class KeyStoreGenerator {
     private void generatePKCS11KeyStore(String keyAlgorithm, int keySize) throws KeyStoreMgtException {
 
         ServerConfiguration config = ServerConfiguration.getInstance();
-        String providerName = StringUtils.trim(config.getFirstProperty(TENANT_KEYSTORE_PROVIDER));
-        String pin = config.getFirstProperty(TENANT_KEYSTORE_PASSWORD);
+        String providerName = StringUtils.trim(config.getFirstProperty(
+                RegistryResources.SecurityManagement.TENANT_KEYSTORE_PROVIDER));
+        String pin = config.getFirstProperty(RegistryResources.SecurityManagement.TENANT_KEYSTORE_PASSWORD);
         if (StringUtils.isBlank(providerName) || StringUtils.isEmpty(pin)) {
             throw new KeyStoreMgtException("[keystore.tenant] provider and password are required when the tenant " +
                     "key store type is " + PKCS11_STORE_TYPE + ".");
@@ -298,7 +295,8 @@ public class KeyStoreGenerator {
                     "is not registered.");
         }
 
-        String label = TOKEN_LABEL_PREFIX + tenantId;
+        // The kernel derives the label from the tenant ID and accepts only that label for this tenant.
+        String label = TenantPKCS11KeyStore.labelFor(tenantId);
         KeyStore token;
         try {
             token = KeyStore.getInstance(PKCS11_STORE_TYPE, provider);
@@ -328,11 +326,8 @@ public class KeyStoreGenerator {
         }
 
         try {
-            byte[] descriptor =
-                    (DESCRIPTOR_LABEL_PROPERTY + "=" + label + "\n").getBytes(StandardCharsets.ISO_8859_1);
-            KeyStoreAdmin keystoreAdmin = new KeyStoreAdmin(tenantId);
-            keystoreAdmin.addKeyStore(descriptor, generateKSNameFromDomainName(), pin, providerName,
-                    PKCS11_STORE_TYPE, pin);
+            // The key store record names the token entry. The token's provider and PIN stay in the configuration.
+            KeyStoreManager.getInstance(tenantId).addTenantPKCS11KeyStore();
         } catch (Exception e) {
             // Do not leave an unreferenced key pair in the token.
             try {

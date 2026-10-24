@@ -49,8 +49,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Test JCA provider that simulates a PKCS#11 token: a "PKCS11" key store (load(null, pin) logs in, key passwords are
- * ignored, entries are stored immediately), an RSA key pair generator and RSA signatures. It records the private keys
+ * Test JCA provider that simulates a PKCS#11 token: a "PKCS11" key store (like SunPKCS11, the first load(null, pin)
+ * logs in and later loads accept any PIN; key passwords are ignored; entries are stored immediately), an RSA key pair generator and RSA signatures. It records the private keys
  * it generated and counts the signatures it made, so tests can check that key generation and certificate signing
  * happened through the token provider.
  */
@@ -62,6 +62,7 @@ public class TestTokenProvider extends Provider {
             {"SHA256withRSA", "SHA384withRSA", "SHA512withRSA", "SHA1withRSA", "MD5withRSA"};
 
     private final char[] pin;
+    private volatile boolean loggedIn;
     private final transient KeyStore token;
     private final transient List<PrivateKey> generatedKeys = new CopyOnWriteArrayList<>();
     private final transient AtomicInteger signatures = new AtomicInteger();
@@ -371,9 +372,14 @@ public class TestTokenProvider extends Provider {
         @Override
         public void engineLoad(InputStream stream, char[] password) throws IOException {
 
+            // Like SunPKCS11, the PIN is checked only when the token is not logged in yet.
+            if (provider.loggedIn) {
+                return;
+            }
             if (password == null || !Arrays.equals(password, provider.pin)) {
                 throw new IOException("Token login failed: wrong PIN.");
             }
+            provider.loggedIn = true;
         }
     }
 }
