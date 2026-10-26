@@ -31,7 +31,6 @@ import org.wso2.carbon.base.ServerConfiguration;
 import org.wso2.carbon.core.RegistryResources;
 import org.wso2.carbon.core.util.CryptoUtil;
 import org.wso2.carbon.core.util.KeyStoreManager;
-import org.wso2.carbon.core.util.TenantPKCS11KeyStore;
 import org.wso2.carbon.keystore.mgt.util.RealmServiceHolder;
 import org.wso2.carbon.security.keystore.KeyStoreAdmin;
 import org.wso2.carbon.user.core.service.RealmService;
@@ -49,6 +48,7 @@ import java.security.SecureRandom;
 import java.security.Security;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
+import java.util.Collections;
 import java.util.Date;
 
 /**
@@ -295,15 +295,25 @@ public class KeyStoreGenerator {
                     "is not registered.");
         }
 
-        // The kernel derives the label from the tenant ID and accepts only that label for this tenant.
-        String label = TenantPKCS11KeyStore.labelFor(tenantId);
+        // The kernel derives the label from the tenant's unique ID and accepts only that label for this tenant.
+        KeyStoreManager keyStoreManager = KeyStoreManager.getInstance(tenantId);
+        String label;
+        try {
+            label = keyStoreManager.getTenantPKCS11KeyLabel();
+        } catch (SecurityException e) {
+            throw new KeyStoreMgtException("Error while getting the token entry label of tenant: " + tenantDomain, e);
+        }
         KeyStore token;
         try {
             token = KeyStore.getInstance(PKCS11_STORE_TYPE, provider);
             token.load(null, pin.toCharArray());
-            if (token.containsAlias(label)) {
-                throw new KeyStoreMgtException("The tenant key store token already has an entry with label: " +
-                        label);
+            // Never add a second entry with the label, or use an entry that is already there. SunPKCS11 lists an
+            // entry whose label is not unique as <label>/<issuer>/<serial number>.
+            for (String alias : Collections.list(token.aliases())) {
+                if (alias.equals(label) || alias.startsWith(label + "/")) {
+                    throw new KeyStoreMgtException("The tenant key store token already has an entry with label: " +
+                            label + ". Remove it from the token before creating the tenant key store.");
+                }
             }
             KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance(keyAlgorithm, provider);
             keyPairGenerator.initialize(keySize);
@@ -327,7 +337,7 @@ public class KeyStoreGenerator {
 
         try {
             // The key store record names the token entry. The token's provider and PIN stay in the configuration.
-            KeyStoreManager.getInstance(tenantId).addTenantPKCS11KeyStore();
+            keyStoreManager.addTenantPKCS11KeyStore();
         } catch (Exception e) {
             // Do not leave an unreferenced key pair in the token.
             try {

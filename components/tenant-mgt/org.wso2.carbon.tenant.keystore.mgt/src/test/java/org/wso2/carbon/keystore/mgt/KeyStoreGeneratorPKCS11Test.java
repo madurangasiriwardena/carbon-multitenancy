@@ -62,7 +62,7 @@ public class KeyStoreGeneratorPKCS11Test {
 
     private static final int TENANT_ID = 7;
     private static final String TENANT_DOMAIN = "hsm.com";
-    private static final String LABEL = "wso2-tenant-7";
+    private static final String LABEL = "wso2-tenant-4e8a1f30-9b2c-4d57-8e61-3a0f7c9d2b14";
     private static final String PROVIDER_NAME = "TestToken-is-tenants";
     private static final String PIN = "1234";
 
@@ -104,6 +104,7 @@ public class KeyStoreGeneratorPKCS11Test {
         RealmServiceHolder.setRealmService(realmService);
 
         keyStoreManager = mock(KeyStoreManager.class);
+        when(keyStoreManager.getTenantPKCS11KeyLabel()).thenReturn(LABEL);
         keyStoreManagerStatic = mockStatic(KeyStoreManager.class);
         keyStoreManagerStatic.when(() -> KeyStoreManager.getInstance(anyInt())).thenReturn(keyStoreManager);
 
@@ -189,6 +190,33 @@ public class KeyStoreGeneratorPKCS11Test {
         assertEquals(tokenProvider.getToken().getCertificate(LABEL), existing);
         // Registered only once, for the first generation.
         verify(keyStoreManager).addTenantPKCS11KeyStore();
+    }
+
+    @Test
+    public void testSharedLabelOnTheTokenIsNotUsed() throws Exception {
+
+        // An entry with the tenant's label exists more than once, so SunPKCS11 lists it as <label>/<issuer>/<serial>.
+        new KeyStoreGenerator(TENANT_ID).generateKeyStore();
+        KeyStore token = tokenProvider.getToken();
+        X509Certificate certificate = (X509Certificate) token.getCertificate(LABEL);
+        token.deleteEntry(LABEL);
+        token.setCertificateEntry(LABEL + "/cn=other/1", certificate);
+
+        KeyStoreMgtException e = expectThrows(KeyStoreMgtException.class,
+                () -> new KeyStoreGenerator(TENANT_ID).generateKeyStore());
+        assertTrue(e.getMessage().contains("already has an entry with label"), e.getMessage());
+        assertFalse(token.containsAlias(LABEL));
+        // Registered only once, for the first generation.
+        verify(keyStoreManager).addTenantPKCS11KeyStore();
+    }
+
+    @Test
+    public void testLabelLookupFailureStopsGeneration() throws Exception {
+
+        when(keyStoreManager.getTenantPKCS11KeyLabel()).thenThrow(new SecurityException("no unique ID"));
+        expectThrows(KeyStoreMgtException.class, () -> new KeyStoreGenerator(TENANT_ID).generateKeyStore());
+        assertEquals(tokenProvider.getToken().size(), 0);
+        verify(keyStoreManager, never()).addTenantPKCS11KeyStore();
     }
 
     @Test
